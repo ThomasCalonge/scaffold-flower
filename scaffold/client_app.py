@@ -1,16 +1,12 @@
-"""pytorchexample: A Flower / PyTorch app."""
-
 import torch
+import numpy as np
+
 from flwr.client import ClientApp, NumPyClient
 from flwr.common import Context
+from flwr.common.logger import log
+from logging import INFO
 
-from pytorchexample.task import Net, get_weights, load_data, set_weights, load_c_local, set_c_local
-from torch.optim import lr_scheduler
-
-import numpy as np
-import copy
-
-from flwr.common.parameter import bytes_to_ndarray
+from scaffold.task import Net, get_weights, load_data, set_weights, load_c_local, set_c_local
 
 class FlowerClient(NumPyClient):
     def __init__(self, trainloader, valloader, local_epochs, learning_rate, partition_id, c_local):
@@ -23,9 +19,7 @@ class FlowerClient(NumPyClient):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.criterion = torch.nn.CrossEntropyLoss().to(self.device)
         self.optimizer = torch.optim.SGD(self.net.parameters(), lr=learning_rate, momentum=0.9)
-        self.scheduler = lr_scheduler.StepLR(self.optimizer, step_size=1, gamma=0.99)
         self.c_local = c_local
-
 
     def fit(self, parameters, config):
         """Train the model with data of this client."""
@@ -52,30 +46,31 @@ class FlowerClient(NumPyClient):
 def train(self, net, trainloader, valloader, epochs, learning_rate, device, config, c_local, parameters):
     """Train the model on the training set."""
     c_global_bytes = config['c_global']
-    # Deserialize c_global list from bytes to float32
+    # Deserialize c_global list from bytes to float64
     c_global = np.frombuffer(c_global_bytes, dtype=np.float64)
-
     # Cache trainable global parameters
     global_weight = [param.detach().clone() for param in self.net.parameters()]
-
     if c_local is None:
-        print("No cache for c_local")
+        log(INFO, f"No cache found for c_local")
         c_local = [torch.zeros_like(param) for param in self.net.parameters()]
 
-    net.to(device)  # move model to GPU if available
+    net.to(device)  # Move model to GPU if available TODO: Make everything work on GPU.
     net.train()
     # Train the global model with local data
     for _ in range(epochs):
+        prebatch_params = [param.detach().clone() for param in self.net.parameters()]
         for batch in trainloader:
-            images = batch["img"]
+            images = batch["image"]
             labels = batch["label"]
             self.optimizer.zero_grad()
             self.criterion(net(images.to(device)), labels.to(device)).backward()
             self.optimizer.step()
 
+        # Local updates to the client model cf. Scaffold equation (n°3)
         # Adds Scaffold computation of c_diff in parameters
-        for param, c_l, c_g in zip(self.net.parameters(), c_local, c_global):
-            param.grad.data -= learning_rate * (c_g - c_l)
+        for param, y_i, c_l, c_g in zip(self.net.parameters(), prebatch_params, c_local, c_global):
+            if param.requires_grad:
+                param.grad.data = y_i - (learning_rate * (param.grad.data - c_l + c_g))
 
     # Update local control variate
     # Declare Scaffold variables
@@ -83,19 +78,13 @@ def train(self, net, trainloader, valloader, epochs, learning_rate, device, conf
     c_plus = []
     c_delta = []
 
-    # Compute y_delta (difference of model before and after training)
-    for param_l, param_g in zip(self.net.parameters(), global_weight):
-        y_delta.append(param_l - param_g)
-
-    # Erase net params with y_delta params for weight averaging in FedAvg
-    for param, new_w in zip(self.net.parameters(), y_delta):
-        param.data = new_w.clone().detach() 
-
-    # Compute c_plus : Options 2
+    # Local updates to the client control variate cf. Scaffold equation (n°4)
+    # Compute c_plus : Option 2
+    coef = 1 / (epochs * learning_rate)
     for c_l, c_g, param_l, param_g in zip(c_local, c_global, self.net.parameters(), global_weight):
-        c_plus.append(c_l - c_g + (param_g - param_l)/(epochs * learning_rate))
+        c_plus.append(c_l - c_g + ((param_g - param_l)*coef))
 
-    # Compute c_plus : Options 1
+    # Compute c_plus : Option 1
     # c_plus_net = Net()
     # set_weights(c_plus_net, parameters)
 
@@ -105,7 +94,7 @@ def train(self, net, trainloader, valloader, epochs, learning_rate, device, conf
     # c_plus_net.to(device)  # move model to GPU if available
     # c_plus_net.train()
     # for batch in trainloader:
-    #     images = batch["img"]
+    #     images = batch["image"]
     #     labels = batch["label"]
     #     optimizer.zero_grad()
     #     criterion(c_plus_net(images.to(device)), labels.to(device)).backward()
@@ -113,6 +102,14 @@ def train(self, net, trainloader, valloader, epochs, learning_rate, device, conf
 
     # for x_param in c_plus_net.parameters():
     #     c_plus.append(x_param)
+
+    # Compute y_delta (difference of model before and after training)
+    for param_l, param_g in zip(self.net.parameters(), global_weight):
+        y_delta.append(param_l - param_g)
+
+    # Erase net params with y_delta params for weight averaging in FedAvg
+    for param, new_w in zip(self.net.parameters(), y_delta):
+        param.data = new_w.clone().detach() 
 
     # Compute c_delta
     for c_p, c_l in zip(c_plus, c_local):
@@ -130,7 +127,6 @@ def train(self, net, trainloader, valloader, epochs, learning_rate, device, conf
     # Serialize to bytes
     c_delta_bytes = c_delta_numpy.tobytes()
 
-    self.scheduler.step()
     val_loss, val_acc = test(net, valloader, device)
 
     results = { 
@@ -147,7 +143,7 @@ def test(net, testloader, device):
     correct, loss = 0, 0.0
     with torch.no_grad():
         for batch in testloader:
-            images = batch["img"].to(device)
+            images = batch["image"].to(device)
             labels = batch["label"].to(device)
             outputs = net(images)
             loss += criterion(outputs, labels).item()
@@ -166,7 +162,7 @@ def client_fn(context: Context):
     # Read run_config to fetch hyperparameters relevant to this run
     batch_size = context.run_config["batch-size"]
     trainloader, valloader = load_data(partition_id, num_partitions, batch_size)
-    c_local = load_c_local(partition_id, num_partitions)
+    c_local = load_c_local(partition_id)
     local_epochs = context.run_config["local-epochs"]
     learning_rate = context.run_config["learning-rate"]
 

@@ -1,9 +1,8 @@
-"""pytorchexample: A Flower / PyTorch app."""
-
 from typing import List, Tuple
-
-from functools import reduce
-import struct
+import torch
+import numpy as np
+import os
+import shutil
 
 from flwr.common import Context, Metrics, ndarrays_to_parameters
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
@@ -20,21 +19,17 @@ from flwr.common import (
     ndarrays_to_parameters,
     parameters_to_ndarrays,
 )
-import flwr as fl
+
 from flwr.server.client_proxy import ClientProxy
 
-import torch
-import numpy as np
-
-from pytorchexample.task import Net, get_weights, set_weights
+from scaffold.task import Net, get_weights, set_weights
 
 class Scaffold(FedAvg):
-    def __init__(self, global_model, global_learning_rate, num_clients, num_clients_per_round, **kwargs):
+    def __init__(self, global_model, global_learning_rate, num_clients, **kwargs):
         super().__init__(**kwargs)
         self.c_global = [torch.zeros_like(param) for param in global_model.parameters()]
         self.current_weights = parameters_to_ndarrays(self.initial_parameters)
         self.num_clients = num_clients
-        self.num_clients_per_round = num_clients_per_round
         self.global_learning_rate = global_learning_rate
 
     def configure_fit(
@@ -67,6 +62,7 @@ class Scaffold(FedAvg):
         ]
         
     def aggregate_fit(self, server_round, results, failures):
+        # Use FedAvg aggregate_fit function to average y_delta weights
         parameters_aggregated, metrics_aggregated = super().aggregate_fit(server_round, results, failures)
 
         if parameters_aggregated is None:
@@ -74,6 +70,7 @@ class Scaffold(FedAvg):
 
         fedavg_weights_aggregate = parameters_to_ndarrays(parameters_aggregated)
 
+        # Aggregating the updates of y_delta to current weight cf. Scaffold equation (n°5)
         for current_weight, fed_weight in zip(self.current_weights, fedavg_weights_aggregate):
             current_weight += fed_weight * self.global_learning_rate
 
@@ -83,13 +80,14 @@ class Scaffold(FedAvg):
         for _, fit_res in results:
             # Getting serialized buffer from fit metrics 
             c_delta = np.frombuffer(fit_res.metrics["c_delta"], dtype=np.float64)
-            # Ajouter chaque delta_c au delta_c_sum
+            # Sum all c_delta in a single weight vector
             for i in range(len(c_delta_sum)):
                 c_delta_sum[i] += np.array(c_delta[i], dtype=np.float64)
 
         for i in range(len(self.c_global)):
-            c_delta_avg = c_delta_sum[i] / self.num_clients_per_round
-            self.c_global[i] += (self.num_clients_per_round / self.num_clients) * torch.tensor(c_delta_avg)
+            # Aggregating the updates of c_global cf. Scaffold equation (n°5)
+            c_delta_avg = c_delta_sum[i] / self.num_clients
+            self.c_global[i] += torch.tensor(c_delta_avg)
 
         return ndarrays_to_parameters(self.current_weights), metrics_aggregated
 
@@ -106,6 +104,20 @@ def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
 
 def server_fn(context: Context):
     """Construct components that set the ServerApp behaviour."""
+    # Construct c_local folder for all clients and erase cache if already present
+    path = "c_local_folder/"
+    if not os.path.exists(path):
+        os.makedirs(path)
+    else: 
+        for filename in os.listdir(path):
+            file_path = os.path.join(path, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+            except Exception as e:
+                print(f"Error while deleting {file_path}: {e}")
 
     # Read from config
     num_rounds = context.run_config["num-server-rounds"]
@@ -118,12 +130,10 @@ def server_fn(context: Context):
     # Define the strategy
     strategy = Scaffold(
         global_model=global_model,
-        num_clients=100,
-        num_clients_per_round=10,
-        global_learning_rate = 1,
-        fraction_fit=0.1, # C=0.1
+        num_clients=context.run_config["num-clients"], # Caution, this config should be always equal to num-supernodes
+        global_learning_rate=context.run_config["global-learning-rate"],
+        fraction_fit=context.run_config["fraction-fit"],
         fraction_evaluate=context.run_config["fraction-evaluate"],
-        min_available_clients=2,
         evaluate_metrics_aggregation_fn=weighted_average,
         initial_parameters=parameters,
     )

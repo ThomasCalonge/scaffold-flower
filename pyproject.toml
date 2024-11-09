@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pytorchexample"
+name = "scaffold"
 version = "1.0.0"
-description = "Federated Learning with PyTorch and Flower (Quickstart Example)"
+description = "Scaffold implementation using PyTorch and Flower (On the simulation environnement)"
 license = "Apache-2.0"
 dependencies = [
     "flwr[simulation]>=1.11.0",
@@ -18,18 +18,21 @@ dependencies = [
 packages = ["."]
 
 [tool.flwr.app]
-publisher = "flwrlabs"
+publisher = "thomas.calonge"
 
 [tool.flwr.app.components]
-serverapp = "pytorchexample.server_app:app"
-clientapp = "pytorchexample.client_app:app"
+serverapp = "scaffold.server_app:app"
+clientapp = "scaffold.client_app:app"
 
 [tool.flwr.app.config]
-num-server-rounds = 5
+num-server-rounds = 100
 fraction-evaluate = 1
+fraction-fit = 0.2
 local-epochs = 5
-learning-rate = 0.1
-batch-size = 50
+num-clients = 100
+learning-rate = 0.0025
+global-learning-rate = 1
+batch-size = 25
 c_global = 0
 
 [tool.flwr.federations]
